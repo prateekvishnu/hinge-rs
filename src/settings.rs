@@ -8,6 +8,11 @@ pub struct Settings {
     pub hinge_app_version: String,
     pub hinge_build_number: String,
     pub os_version: String,
+    /// `x-device-region`. Hardcoded to `IN` before this was configurable, which is wrong for
+    /// most accounts; kept as the default only to avoid changing behaviour silently.
+    pub device_region: String,
+    /// `accept-language`. Same story as `device_region`, previously fixed at `en-GB`.
+    pub accept_language: String,
 }
 
 impl Default for Settings {
@@ -33,6 +38,9 @@ impl Default for Settings {
             hinge_build_number: std::env::var("HINGE_BUILD_NUMBER")
                 .unwrap_or_else(|_| "11639".into()),
             os_version: std::env::var("OS_VERSION").unwrap_or_else(|_| "26.0".into()),
+            device_region: std::env::var("HINGE_DEVICE_REGION").unwrap_or_else(|_| "IN".into()),
+            accept_language: std::env::var("HINGE_ACCEPT_LANGUAGE")
+                .unwrap_or_else(|_| "en-GB".into()),
         }
     }
 }
