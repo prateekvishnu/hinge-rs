@@ -99,7 +99,7 @@ impl<S: Storage + Clone> ChatApi<'_, S> {
     }
 
     pub async fn send_message(
-        &self,
+        &mut self,
         payload: SendMessagePayload,
     ) -> Result<serde_json::Value, HingeError> {
         self.client.send_message(payload).await

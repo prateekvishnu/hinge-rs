@@ -134,16 +134,67 @@ impl<S: Storage + Clone> HingeClient<S> {
         Ok(res)
     }
 
+    /// True when there is no Sendbird JWT, or the one we hold has already expired.
+    ///
+    /// The JWT is restored from [`Storage`] and can be arbitrarily old by the time a chat call
+    /// runs, so "do we have one?" is not the same question as "can we use one?". Fetching only
+    /// when the slot was empty let a stale token through, and it fails in a way that names
+    /// nothing about expiry: the WS handshake carries auth in a header the server accepts
+    /// without validating, so no `LOGI` frame comes back, no `Session-Key` is captured, and
+    /// every subsequent Sendbird REST read answers `400 "Api-Token is missing"`.
+    fn sendbird_auth_needs_refresh(&self) -> bool {
+        match self.sendbird_auth.as_ref() {
+            None => true,
+            Some(sb) => sb.expires <= chrono::Utc::now(),
+        }
+    }
+
+    /// Fetch a fresh Sendbird JWT if the current one is missing or expired.
+    ///
+    /// The `Session-Key` is dropped alongside it because that key was derived from the old JWT:
+    /// keeping it would send the stale credential right back through the WS handshake
+    /// (`SENDBIRD-WS-AUTH` is preferred over `SENDBIRD-WS-TOKEN` whenever a key is present).
+    /// Clearing the key *alone* is not a fix either — the REST calls then go out with no
+    /// `Session-Key` header at all, which Hinge answers `400401 "Api-Token is missing"`.
+    async fn refresh_sendbird_auth_if_stale(&mut self) -> Result<(), HingeError> {
+        if !self.sendbird_auth_needs_refresh() {
+            return Ok(());
+        }
+        log::info!("[sendbird] JWT missing or expired - re-authenticating");
+        // A live socket was authenticated with the token being replaced, so it goes too. Without
+        // this, dropping the key while the socket stayed up would leave nothing to re-capture a
+        // key: the next call would see a connected socket, skip the handshake, and send its REST
+        // requests with no `Session-Key` header at all.
+        if self.sendbird_ws_connected {
+            self.sendbird_ws_close(None, None).await.ok();
+        }
+        self.sendbird_session_key = None;
+        self.authenticate_with_sendbird().await?;
+        Ok(())
+    }
+
+    /// Discard the Sendbird JWT and `Session-Key` so the next call authenticates from scratch.
+    ///
+    /// [`Self::refresh_sendbird_auth_if_stale`] only catches a token past its own `expires`. It
+    /// cannot catch one Sendbird has stopped honouring while it still looks valid, and that
+    /// failure is silent in a particular way: WS auth is carried solely by the
+    /// `SENDBIRD-WS-AUTH` header, so a key the server rejects does not fail the handshake. The
+    /// socket connects as a *guest* and only the first write reveals it, as
+    /// `EROR code 900030 "Guest is not allowed."` Reads keep working throughout, which is why
+    /// this presents as "sending is broken" rather than "auth is stale". Call this, then retry.
+    pub fn invalidate_sendbird_session(&mut self) {
+        self.sendbird_auth = None;
+        self.sendbird_session_key = None;
+    }
+
     async fn ensure_sendbird_session(&mut self) -> Result<(), HingeError> {
         // If a WS is already connected, we're good
         if self.sendbird_ws_connected {
             return Ok(());
         }
 
-        // Ensure we have Sendbird JWT from Hinge
-        if self.sendbird_auth.is_none() {
-            self.authenticate_with_sendbird().await?;
-        }
+        // Ensure we have a *usable* Sendbird JWT from Hinge, not merely any JWT
+        self.refresh_sendbird_auth_if_stale().await?;
 
         // Start and hold a single WS connection; capture LOGI and broadcast frames
         let (cmd_tx, broadcast_tx) = self.start_sendbird_ws().await?;
@@ -341,6 +392,27 @@ impl<S: Storage + Clone> HingeClient<S> {
                                             req_id
                                         );
                                     }
+                                }
+                            }
+                            // Handle MESG echoes and EROR refusals. A sent message is confirmed
+                            // by the server echoing it back with our own `req_id`; anything it
+                            // rejects (guest connection, muted sender, frozen channel, bad
+                            // payload) comes back as EROR rather than as a dropped connection.
+                            // Both are routed to whichever caller is awaiting that `req_id`.
+                            else if (t.starts_with("MESG") || t.starts_with("EROR"))
+                                && let Some(start) = t.find('{')
+                                && let Ok(val) =
+                                    serde_json::from_str::<serde_json::Value>(&t[start..])
+                                && let Some(req_id) = val.get("req_id").and_then(|v| v.as_str())
+                            {
+                                let mut pending = pending_requests.lock().await;
+                                if let Some(tx) = pending.remove(req_id) {
+                                    let _ = tx.send(val.clone());
+                                    log::debug!(
+                                        "[sendbird ws] Matched {} response for req_id: {}",
+                                        &t[..4],
+                                        req_id
+                                    );
                                 }
                             }
                             // Broadcast all messages to subscribers
@@ -954,10 +1026,8 @@ impl<S: Storage + Clone> HingeClient<S> {
 
     /// Return Sendbird credentials for the JS client (appId and token), ensuring auth
     pub async fn sendbird_creds(&mut self) -> Result<serde_json::Value, HingeError> {
-        // Ensure we have Sendbird JWT from Hinge but do not start WS
-        if self.sendbird_auth.is_none() {
-            self.authenticate_with_sendbird().await?;
-        }
+        // Ensure we have a usable Sendbird JWT from Hinge but do not start WS
+        self.refresh_sendbird_auth_if_stale().await?;
         let app_id = self.settings.sendbird_app_id.clone();
         let token = self
             .sendbird_auth
@@ -1062,6 +1132,73 @@ impl<S: Storage + Clone> HingeClient<S> {
                 let mut pending = self.sendbird_ws_pending_requests.lock().await;
                 pending.remove(&req_id);
                 Err(HingeError::Http("READ response timeout".into()))
+            }
+        }
+    }
+
+    /// Send a chat message over the Sendbird WebSocket and wait for the server to confirm it.
+    ///
+    /// This is the transport the Hinge app itself uses. Sendbird confirms a `MESG` by echoing
+    /// the stored message back carrying the same `req_id`, and refuses one with an `EROR`
+    /// frame; both are matched here on that `req_id`.
+    ///
+    /// A timeout is reported as its own error rather than folded into either outcome, because
+    /// it is genuinely ambiguous: the frame was written, so the message may well have landed.
+    /// Callers should re-read the channel before resending rather than retry blindly.
+    pub async fn sendbird_ws_send_message_and_wait(
+        &mut self,
+        channel_url: &str,
+        text: &str,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, HingeError> {
+        self.ensure_sendbird_session().await?;
+
+        let req_id = Uuid::new_v4().to_string().to_uppercase();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut pending = self.sendbird_ws_pending_requests.lock().await;
+            pending.insert(req_id.clone(), tx);
+        }
+
+        // Frames are newline-terminated in Sendbird's WS protocol, and building the body with
+        // serde_json rather than string interpolation is what keeps quotes, newlines and emoji
+        // in the message from corrupting the frame.
+        let frame = format!(
+            "MESG{}
+",
+            json!({
+                "channel_url": channel_url,
+                "message": text,
+                "req_id": req_id,
+                "mention_type": "users",
+            })
+        );
+        if let Err(e) = self.sendbird_ws_send_command(frame).await {
+            let mut pending = self.sendbird_ws_pending_requests.lock().await;
+            pending.remove(&req_id);
+            return Err(e);
+        }
+
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(body)) => match crate::ws::sendbird_frame_refusal(&body) {
+                Some(refusal) => Err(HingeError::SendbirdRefused {
+                    code: refusal.code,
+                    message: refusal.message,
+                }),
+                None => Ok(body),
+            },
+            Ok(Err(_)) => {
+                let mut pending = self.sendbird_ws_pending_requests.lock().await;
+                pending.remove(&req_id);
+                Err(HingeError::Http("MESG response channel dropped".into()))
+            }
+            Err(_) => {
+                let mut pending = self.sendbird_ws_pending_requests.lock().await;
+                pending.remove(&req_id);
+                Err(HingeError::Http(format!(
+                    "no confirmation from Sendbird after {}s - re-read the channel to check                      whether the message landed before resending",
+                    timeout.as_secs()
+                )))
             }
         }
     }
@@ -1184,5 +1321,57 @@ impl<S: Storage + Clone> HingeClient<S> {
         log::info!("[sendbird ws] Reconnecting WebSocket...");
         self.start_sendbird_ws().await?;
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::SendbirdAuthToken;
+    use crate::storage::FsStorage;
+
+    fn client() -> HingeClient<FsStorage> {
+        HingeClient::new("+15555550123", FsStorage, None)
+    }
+
+    fn token(expires: DateTime<Utc>) -> SendbirdAuthToken {
+        SendbirdAuthToken {
+            token: "sendbird-token".to_string(),
+            expires,
+        }
+    }
+
+    #[test]
+    fn a_missing_token_needs_a_refresh() {
+        assert!(client().sendbird_auth_needs_refresh());
+    }
+
+    #[test]
+    fn an_expired_token_needs_a_refresh() {
+        let mut c = client();
+        c.sendbird_auth = Some(token(Utc::now() - chrono::Duration::minutes(1)));
+        assert!(c.sendbird_auth_needs_refresh());
+    }
+
+    #[test]
+    fn a_live_token_is_kept() {
+        let mut c = client();
+        c.sendbird_auth = Some(token(Utc::now() + chrono::Duration::hours(1)));
+        assert!(!c.sendbird_auth_needs_refresh());
+    }
+
+    #[test]
+    fn invalidating_the_session_drops_the_key_as_well_as_the_token() {
+        let mut c = client();
+        c.sendbird_auth = Some(token(Utc::now() + chrono::Duration::hours(1)));
+        c.sendbird_session_key = Some("session-key".to_string());
+
+        c.invalidate_sendbird_session();
+
+        // The key was derived from the token, so keeping it would send the dead credential
+        // straight back through the WS handshake.
+        assert!(c.sendbird_auth.is_none());
+        assert!(c.sendbird_session_key.is_none());
+        assert!(c.sendbird_auth_needs_refresh());
     }
 }
