@@ -576,8 +576,16 @@ impl<S: Storage + Clone> HingeClient<S> {
                         let _ = w.send(Message::Close(Some(close_frame))).await;
                         break; // Stop the writer task after sending close
                     } else {
-                        // Regular text command
-                        let _ = w.send(Message::Text(cmd.into())).await;
+                        // Regular text command. Sendbird's WS protocol terminates frames with a
+                        // newline, so it is added here rather than in each frame builder: one
+                        // place that cannot be forgotten, and idempotent for callers that
+                        // already terminated their own frame.
+                        let frame = if cmd.ends_with('\n') {
+                            cmd
+                        } else {
+                            format!("{}\n", cmd)
+                        };
+                        let _ = w.send(Message::Text(frame.into())).await;
                     }
                 }
             });
@@ -1088,50 +1096,51 @@ impl<S: Storage + Clone> HingeClient<S> {
         self.sendbird_ws_send_command(read_command).await
     }
 
-    /// Send a READ acknowledgment and wait for the response
-    pub async fn sendbird_ws_send_read_and_wait(
+    /// Mark a channel read, and confirm only that Sendbird did not refuse it.
+    ///
+    /// This deliberately does not wait for an acknowledgment, because none arrives: Sendbird
+    /// sends the *reader* no echo for their own `READ`. Measured against a live account, a 10s
+    /// wait produced nothing at all while the channel's unread count did drop to zero — so the
+    /// previous implementation, which awaited a matching `READ` frame, timed out on every call
+    /// and reported failure for work that had in fact succeeded.
+    ///
+    /// What can still come back is a refusal, so the frame is sent and the socket watched for an
+    /// `EROR` for `refusal_window`. Silence is the success path. Callers wanting positive proof
+    /// should re-read the channel and check `unread_message_count`, which is the real evidence.
+    pub async fn sendbird_ws_send_read_and_confirm(
         &mut self,
         channel_url: &str,
-    ) -> Result<crate::models::SendbirdReadResponse, HingeError> {
-        self.ensure_sendbird_session().await?;
+        refusal_window: Duration,
+    ) -> Result<(), HingeError> {
+        let (commands, mut frames) = self.sendbird_ws_subscribe().await?;
 
-        // Generate request ID
         let req_id = Uuid::new_v4().to_string().to_uppercase();
-
-        // Create oneshot channel for response
-        let (tx, rx) = tokio::sync::oneshot::channel();
-
-        // Register the pending request
-        {
-            let mut pending = self.sendbird_ws_pending_requests.lock().await;
-            pending.insert(req_id.clone(), tx);
-        }
-
-        // Send the READ command
         let read_command = format!(
             r#"READ{{"req_id":"{}","channel_url":"{}"}}"#,
             req_id, channel_url
         );
-        self.sendbird_ws_send_command(read_command).await?;
+        commands
+            .send(read_command)
+            .map_err(|e| HingeError::Http(format!("Failed to send WS command: {}", e)))?;
 
-        // Wait for response with timeout
-        match tokio::time::timeout(Duration::from_secs(5), rx).await {
-            Ok(Ok(response)) => {
-                // Parse the JSON response into our typed model
-                parse_json_value_with_path(response)
-                    .map_err(|e| HingeError::Http(format!("Failed to parse READ response: {}", e)))
-            }
-            Ok(Err(_)) => {
-                // Channel was dropped, clean up
-                let mut pending = self.sendbird_ws_pending_requests.lock().await;
-                pending.remove(&req_id);
-                Err(HingeError::Http("READ response channel dropped".into()))
-            }
-            Err(_) => {
-                // Timeout, clean up
-                let mut pending = self.sendbird_ws_pending_requests.lock().await;
-                pending.remove(&req_id);
-                Err(HingeError::Http("READ response timeout".into()))
+        let deadline = tokio::time::Instant::now() + refusal_window;
+        loop {
+            match tokio::time::timeout_at(deadline, frames.recv()).await {
+                Ok(Ok(raw)) => {
+                    if let Some(refusal) = read_refusal_for(&raw, &req_id) {
+                        return Err(HingeError::SendbirdRefused {
+                            code: refusal.code,
+                            message: refusal.message,
+                        });
+                    }
+                }
+                // Lagged or closed: nothing in what we did see refused the read.
+                Ok(Err(e)) => {
+                    log::debug!("[sendbird ws] stopped watching for a READ refusal: {}", e);
+                    return Ok(());
+                }
+                // The window closed with no refusal - the good path.
+                Err(_) => return Ok(()),
             }
         }
     }
@@ -1160,12 +1169,11 @@ impl<S: Storage + Clone> HingeClient<S> {
             pending.insert(req_id.clone(), tx);
         }
 
-        // Frames are newline-terminated in Sendbird's WS protocol, and building the body with
-        // serde_json rather than string interpolation is what keeps quotes, newlines and emoji
-        // in the message from corrupting the frame.
+        // Building the body with serde_json rather than string interpolation is what keeps
+        // quotes, newlines and emoji in the message from corrupting the frame. Terminating the
+        // frame is the writer's job.
         let frame = format!(
-            "MESG{}
-",
+            "MESG{}",
             json!({
                 "channel_url": channel_url,
                 "message": text,
@@ -1196,7 +1204,7 @@ impl<S: Storage + Clone> HingeClient<S> {
                 let mut pending = self.sendbird_ws_pending_requests.lock().await;
                 pending.remove(&req_id);
                 Err(HingeError::Http(format!(
-                    "no confirmation from Sendbird after {}s - re-read the channel to check                      whether the message landed before resending",
+                    "no confirmation from Sendbird after {}s - re-read the channel to check whether the message landed before resending",
                     timeout.as_secs()
                 )))
             }
@@ -1324,6 +1332,21 @@ impl<S: Storage + Clone> HingeClient<S> {
     }
 }
 
+/// An `EROR` frame that refuses the `READ` we sent, if this frame is one.
+///
+/// Sendbird does not always echo `req_id` on an error, so a refusal carrying none is treated as
+/// ours; one carrying a *different* id belongs to another in-flight command and is ignored.
+fn read_refusal_for(frame: &str, req_id: &str) -> Option<crate::ws::SendbirdRefusal> {
+    if !frame.starts_with("EROR") {
+        return None;
+    }
+    let body: serde_json::Value = serde_json::from_str(frame[4..].trim()).ok()?;
+    match body.get("req_id").and_then(serde_json::Value::as_str) {
+        Some(id) if id != req_id => None,
+        _ => crate::ws::sendbird_frame_refusal(&body),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1339,6 +1362,35 @@ mod tests {
             token: "sendbird-token".to_string(),
             expires,
         }
+    }
+
+    #[test]
+    fn an_eror_for_our_read_is_a_refusal() {
+        let frame = r#"EROR{"error":true,"code":900041,"message":"User is muted.","req_id":"R1"}"#;
+        let refusal = read_refusal_for(frame, "R1").expect("should be read as a refusal");
+        assert_eq!(refusal.code, 900041);
+    }
+
+    #[test]
+    fn an_eror_for_another_command_is_ignored() {
+        let frame =
+            r#"EROR{"error":true,"code":900041,"message":"User is muted.","req_id":"OTHER"}"#;
+        assert!(read_refusal_for(frame, "R1").is_none());
+    }
+
+    #[test]
+    fn an_eror_with_no_req_id_is_treated_as_ours() {
+        let frame = r#"EROR{"error":true,"code":900030,"message":"Guest is not allowed."}"#;
+        let refusal = read_refusal_for(frame, "R1").expect("should be read as a refusal");
+        assert!(refusal.is_guest_not_allowed());
+    }
+
+    #[test]
+    fn a_read_echo_is_not_a_refusal() {
+        // Sendbird never sends the reader this frame, but another member's READ is broadcast to
+        // us and must not be mistaken for our own command failing.
+        let frame = r#"READ{"channel_url":"c1","user":{"user_id":"u2"},"req_id":"R1"}"#;
+        assert!(read_refusal_for(frame, "R1").is_none());
     }
 
     #[test]
